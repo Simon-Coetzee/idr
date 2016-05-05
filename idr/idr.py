@@ -22,10 +22,27 @@ from idr.optimization import estimate_model_params, old_estimator
 from idr.utility import calc_post_membership_prbs, compute_pseudo_values
 
 Peak = namedtuple(
-    'Peak', ['chrm', 'strand', 'start', 'stop', 'signal', 'summit'])
+    'Peak', ['chrm', 'strand', 'start', 'stop', 'signal', 'summit', 'signalValue', 'pValue', 'qValue'])
 MergedPeak = namedtuple(
     'Peak', ['chrm', 'strand', 'start', 'stop', 'summit', 
              'merged_signal', 'signals', 'pks'])
+
+def load_gff(fp):
+    """
+    chr20   GRIT    TSS     36322438        36322468        44      +       .       gene_id 'chr20_plus_36322407_36500530'; gene_name 'chr20_plus_36322407_36500530'; tss_id 'TSS_chr20_plus_36322407_36500530_pk1'; peak_cov '7,0,11,0,0,0,0,0,3,0,1,0,0,0,6,0,0,0,0,0,3,0,4,0,0,0,8,0,0,1';
+    """
+    grpd_peaks = defaultdict(list)
+    for line in fp:
+        if line.startswith("#"): continue
+        if line.startswith("track"): continue
+        data = line.split()
+        signal = float(data[5])
+        peak = Peak(data[0], data[6], 
+                    int(float(data[3])), int(float(data[4])), 
+                    signal, None, 
+                    None, None, None )
+        grpd_peaks[(peak.chrm, peak.strand)].append(peak)
+    return grpd_peaks
 
 def load_bed(fp, signal_index, peak_summit_index=None):
     grpd_peaks = defaultdict(list)
@@ -34,19 +51,35 @@ def load_bed(fp, signal_index, peak_summit_index=None):
         if line.startswith("track"): continue
         data = line.split()
         signal = float(data[signal_index])
-        if signal < 0: 
+        if idr.ONLY_ALLOW_NON_NEGATIVE_VALUES and signal < 0:
             raise ValueError("Invalid Signal Value: {:e}".format(signal))
         if peak_summit_index == None or int(data[peak_summit_index]) == -1:
             summit = None
         else:
             summit = int(data[peak_summit_index]) + int(float(data[1]))
         assert summit == None or summit >= 0
-        
         peak = Peak(data[0], data[5], 
                     int(float(data[1])), int(float(data[2])), 
-                    signal, summit )
+                    signal, summit, 
+                    float(data[6]), float(data[7]), float(data[8]) 
+        )
         grpd_peaks[(peak.chrm, peak.strand)].append(peak)
     return grpd_peaks
+
+def correct_multi_summit_peak_IDR_values(idr_values, merged_peaks):
+    assert len(idr_values) == len(merged_peaks)
+    new_values = idr_values.copy()
+    # find the maximum IDR value for each peak
+    pk_idr_values = defaultdict(lambda: float('inf')) 
+    for i, pk in enumerate(merged_peaks):
+        pk_idr_values[(pk.chrm, pk.strand, pk.start, pk.stop)] = min(
+            pk_idr_values[(pk.chrm, pk.strand, pk.start, pk.stop)], 
+            idr_values[i]
+        )
+    # update the values
+    for i, pk in enumerate(merged_peaks):
+        new_values[i] = pk_idr_values[(pk.chrm, pk.strand, pk.start, pk.stop)]
+    return new_values
 
 def iter_merge_grpd_intervals(
         intervals, n_samples, pk_agg_fn,
@@ -118,7 +151,6 @@ def iter_matched_oracle_pks(
                   if sample_id == 0]
     # if there are zero oracle peaks in this 
     if len(oracle_pks) == 0: return None
-
     # for each oracle peak, find score the replicate peaks
     for oracle_pk in oracle_pks:
         peaks_and_scores = OrderedDict([(i+1, []) for i in range(n_samples)])
@@ -138,18 +170,10 @@ def iter_matched_oracle_pks(
             
             peaks_and_scores[sample_id].append(
                 ((summit_distance, -overlap_frac, -pk.signal), pk))
-        
-        # if we want to use nonoverlapping peaks, add zero score peaks
-        # for any replicate that doesn't have a matching peak
-        if use_nonoverlapping_peaks:
-            for sample_id, pks in peaks_and_scores.items():
-                if len(pks) == 0: 
-                    pks.append(((0, 0.0, 0.0), pk))
-        
-        # skip regions that dont have a peak in all replicates. Note that if
-        # we're using non-overlapping peaks, then we jsut added them and so
-        # this will never evaluate to true
-        if any(0 == len(peaks) for peaks in peaks_and_scores.values()):
+                
+        # skip regions that dont have a peak in all replicates. 
+        if not use_nonoverlapping_peaks and any(
+                0 == len(peaks) for peaks in peaks_and_scores.values()):
             continue
         
         # build the aggregated signal value, which is jsut the signal value
@@ -158,12 +182,18 @@ def iter_matched_oracle_pks(
         rep_pks = []
         for rep_id, scored_pks in peaks_and_scores.items():
             scored_pks.sort()
-            signals.append(scored_pks[0][1].signal)
-            rep_pks.append( [scored_pks[0][1],] )
+            if len(scored_pks) == 0:
+                assert use_nonoverlapping_peaks
+                signals.append(0)
+                rep_pks.append(None)
+            else:
+                signals.append(scored_pks[0][1].signal)
+                rep_pks.append( [scored_pks[0][1],] )
+        all_peaks = [oracle_pk,] + rep_pks
         new_pk = (oracle_pk.start, oracle_pk.stop, oracle_pk.summit, 
                   pk_agg_fn(signals), 
                   signals, 
-                  [oracle_pk,] + rep_pks)
+                  OrderedDict(zip(range(len(all_peaks)), all_peaks)))
         yield new_pk
     
     return
@@ -264,7 +294,8 @@ def build_rank_vectors(merged_peaks):
              numpy.array(rank2, dtype=numpy.int) )
 
 def build_idr_output_line_with_bed6(
-        m_pk, IDR, localIDR, output_file_type, signal_type):
+        m_pk, IDR, localIDR, output_file_type, signal_type, 
+        use_oracle_peak_values=True):
     # initialize the line with the bed6 entires - these are 
     # present in all of the output types
     rv = [m_pk.chrm, str(m_pk.start), str(m_pk.stop), 
@@ -274,11 +305,18 @@ def build_idr_output_line_with_bed6(
         pass
     # for narrow/broad peak files, we need to add the 3 score fields
     elif output_file_type in ('narrowPeak', 'broadPeak'):
-        # set the signal values that we didn't use to -1 per the standard 
-        signal_values = ["-1", "-1", "-1"]
-        signal_values[
-            {"signal.value": 0, "p.value": 1, "q.value": 2}[signal_type]
-            ] = ("%.5f" % m_pk.merged_signal)
+        # if we want to use the oracle peak values for the scores, and an oracle
+        # peak is specified
+        if use_oracle_peak_values and 0 in m_pk.pks:
+            signal_values = [
+                m_pk.pks[0].signalValue, m_pk.pks[0].pValue, m_pk.pks[0].qValue]
+            signal_values = ["%.5f" % x for x in signal_values]
+        else:
+            # set the signal values that we didn't use to -1 per the standard 
+            signal_values = ["-1", "-1", "-1"]
+            signal_values[
+                {"signal.value": 0, "p.value": 1, "q.value": 2}[signal_type]
+                ] = ("%.5f" % m_pk.merged_signal)
         rv.extend(signal_values)
         # if this is a narrow peak, we also need to add the summit
         if output_file_type == 'narrowPeak':
@@ -292,13 +330,22 @@ def build_idr_output_line_with_bed6(
 
     for key, signal in enumerate(m_pk.signals):
         # we add one to the key because key=0 corresponds to the oracle peaks
-        rv.append( "%i" % min(x.start for x in m_pk.pks[key+1]))
-        rv.append( "%i" % max(x.stop for x in m_pk.pks[key+1]))
-        rv.append( "%.5f" % signal )
-        if output_file_type == 'narrowPeak':
-            rv.append( "%i" % int(
-                mean(x.summit-x.start for x in m_pk.pks[key+1])
-            ))
+        key += 1
+        # if there is no matching peak for this replicate
+        if m_pk.pks[key] is None:
+            rv.append("-1")
+            rv.append("-1")
+            rv.append( "%.5f" % signal )
+            if output_file_type == 'narrowPeak':
+                rv.append("-1")
+        else:
+            rv.append( "%i" % min(x.start for x in m_pk.pks[key]))
+            rv.append( "%i" % max(x.stop for x in m_pk.pks[key]))
+            rv.append( "%.5f" % signal )
+            if output_file_type == 'narrowPeak':
+                rv.append( "%i" % int(
+                    mean(x.summit-x.start for x in m_pk.pks[key])
+                ))
                                        
             
     return "\t".join(rv)
@@ -318,7 +365,7 @@ def build_backwards_compatible_idr_output_line(
         
     return "\t".join(rv)
 
-def calc_IDR(theta, r1, r2):
+def calc_local_IDR(theta, r1, r2):
     """
     idr <- 1 - e.z
     o <- order(idr)
@@ -341,6 +388,9 @@ def calc_IDR(theta, r1, r2):
     # it doesn't make sense for the IDR values to be smaller than the 
     # optimization tolerance
     localIDR = numpy.clip(localIDR, idr.CONVERGENCE_EPS_DEFAULT, 1)
+    return localIDR
+
+def calc_global_IDR(localIDR):
     local_idr_order = localIDR.argsort()
     ordered_local_idr = localIDR[local_idr_order]
     ordered_local_idr_ranks = rankdata( ordered_local_idr, method='max' )
@@ -348,14 +398,13 @@ def calc_IDR(theta, r1, r2):
     for i, rank in enumerate(ordered_local_idr_ranks):
         IDR.append(ordered_local_idr[:rank].mean())
     IDR = numpy.array(IDR)[local_idr_order.argsort()]
+    return IDR
 
-    return localIDR, IDR
-
-def fit_model_and_calc_idr(r1, r2, 
-                           starting_point=None,
-                           max_iter=idr.MAX_ITER_DEFAULT, 
-                           convergence_eps=idr.CONVERGENCE_EPS_DEFAULT, 
-                           fix_mu=False, fix_sigma=False ):
+def fit_model_and_calc_local_idr(r1, r2, 
+                                 starting_point=None,
+                                 max_iter=idr.MAX_ITER_DEFAULT, 
+                                 convergence_eps=idr.CONVERGENCE_EPS_DEFAULT, 
+                                 fix_mu=False, fix_sigma=False):
     # in theory we would try to find good starting point here,
     # but for now just set it to somethign reasonable
     if type(starting_point) == type(None):
@@ -394,9 +443,8 @@ def fit_model_and_calc_idr(r1, r2,
     idr.log("Final parameter values: [%s]"%" ".join("%.2f" % x for x in theta))
     
     # calculate the global IDR
-    localIDRs, IDRs = calc_IDR(numpy.array(theta), r1, r2)
-
-    return localIDRs, IDRs
+    localIDRs = calc_local_IDR(numpy.array(theta), r1, r2)
+    return localIDRs
 
 def write_results_to_file(merged_peaks, output_file, 
                           output_file_type, signal_type,
@@ -473,7 +521,7 @@ Contact: Nathan Boley <npboley@gmail.com>
     parser.add_argument( '--peak-list', '-p', type=PossiblyGzippedFile,
         help='If provided, all peaks will be taken from this file.')
     parser.add_argument( '--input-file-type', default='narrowPeak',
-        choices=['narrowPeak', 'broadPeak', 'bed'], 
+                         choices=['narrowPeak', 'broadPeak', 'bed', 'gff'], 
         help='File type of --samples and --peak-list.')
     
     parser.add_argument( '--rank',
@@ -485,6 +533,10 @@ Contact: Nathan Boley <npboley@gmail.com>
     parser.add_argument( '--output-file', "-o", 
                          default=default_ofname, 
         help='File to write output to.\nDefault: {}'.format(default_ofname))
+    parser.add_argument( '--output-file-type', 
+                         choices=['narrowPeak', 'broadPeak', 'bed'], 
+                         default=None, 
+        help='Output file type. Defaults to input file type when available, otherwise bed.')
 
     parser.add_argument( '--log-output-file', "-l", type=argparse.FileType("w"),
                          default=sys.stderr,
@@ -531,6 +583,20 @@ Contact: Nathan Boley <npboley@gmail.com>
     parser.add_argument( '--fix-sigma', action='store_true', 
         help="Fix sigma to the starting point and do not let it vary.")    
 
+    parser.add_argument( '--dont-filter-peaks-below-noise-mean', 
+                         default=False,
+                         action='store_true', 
+        help="Allow signal points that are below the noise mean (should only be used if you know what you are doing).")    
+
+    parser.add_argument( '--use-best-multisummit-IDR',
+                         default=False, action='store_true',
+        help="Set the IDR value for a group of multi summit peaks (same chr/start/stop but different summit) to the best value across all peaks. This is a work around for peak callers that don't do a good job splitting scores across multi summit peaks.")
+
+    parser.add_argument( '--allow-negative-scores', 
+                         default=False,
+                         action='store_true', 
+        help="Allow negative values for scores. (should only be used if you know what you are doing)")    
+
     parser.add_argument( '--random-seed', type=int, default=0, 
         help="The random seed value (sor braking ties). Default: 0") 
     parser.add_argument( '--max-iter', type=int, default=idr.MAX_ITER_DEFAULT, 
@@ -556,6 +622,12 @@ Contact: Nathan Boley <npboley@gmail.com>
 
     args.output_file = open(args.output_file, "w")
     idr.log_ofp = args.log_output_file
+
+    if args.output_file_type is None:
+        if args.input_file_type in ('narrowPeak', 'broadPeak', 'bed'):
+            args.output_file_type = args.input_file_type
+        else:
+            args.output_file_type = 'bed'
     
     if args.verbose: 
         idr.VERBOSE = True 
@@ -565,6 +637,12 @@ Contact: Nathan Boley <npboley@gmail.com>
         idr.QUIET = True 
         idr.VERBOSE = False
 
+    if args.dont_filter_peaks_below_noise_mean is True:
+        idr.FILTER_PEAKS_BELOW_NOISE_MEAN = False
+
+    if args.allow_negative_scores is True:
+        idr.ONLY_ALLOW_NON_NEGATIVE_VALUES = False
+        
     assert idr.DEFAULT_IDR_THRESH == 1.0
     if args.idr_threshold == None and args.soft_idr_threshold == None:
         args.idr_threshold = idr.DEFAULT_IDR_THRESH
@@ -649,10 +727,27 @@ def load_samples(args):
         oracle_pks =  (
             load_bed(args.peak_list, signal_index) 
             if args.peak_list != None else None)
+    elif args.input_file_type in ['gff', ]:
+        # set the default
+        if args.rank == None: 
+            signal_type = 'score'
+        else:
+            assert args.rank == 'score'
+        
+        if args.peak_merge_method == None:
+            peak_merge_fn = sum
+        else:
+            peak_merge_fn = {
+                "sum": sum, "avg": mean, "min": min, "max": max}[
+                    args.peak_merge_method]
+        
+        f1, f2 = [load_gff(fp) for fp in args.samples]
+        oracle_pks =  (
+            load_gff(args.peak_list) 
+            if args.peak_list != None else None)
     else:
         raise ValueError( "Unrecognized file type: '{}'".format(
             args.input_file_type))
-        
     # build a unified peak set
     idr.log("Merging peaks", 'VERBOSE')
     merged_peaks = merge_peaks([f1, f2], peak_merge_fn, 
@@ -746,10 +841,10 @@ def main():
             error_msg += "\nHint: Merged peaks were written to the output file"
             write_results_to_file(
                 merged_peaks, args.output_file,
-                args.input_file_type, signal_type)
+                args.output_file_type, signal_type)
             raise ValueError(error_msg)
 
-        localIDRs, IDRs = fit_model_and_calc_idr(
+        localIDRs = fit_model_and_calc_local_idr(
             r1, r2, 
             starting_point=(
                 args.initial_mu, args.initial_sigma, 
@@ -757,15 +852,21 @@ def main():
             max_iter=args.max_iter,
             convergence_eps=args.convergence_eps,
             fix_mu=args.fix_mu, fix_sigma=args.fix_sigma )    
+
+        if args.use_max_IDR_score_across_multi_summit_peaks:
+            localIDRs = correct_multi_summit_peak_IDR_values(
+                localIDRs, merged_peaks)
+        IDRs = calc_global_IDR(localIDRs)
         
         if args.plot:
             assert len(args.samples) == 2
             plot(args, [s1, s2], [r1, r2], IDRs)
+        
     
     num_peaks_passing_thresh = write_results_to_file(
         merged_peaks, 
         args.output_file, 
-        args.input_file_type, 
+        args.output_file_type, 
         signal_type,
         localIDRs=localIDRs, 
         IDRs=IDRs,

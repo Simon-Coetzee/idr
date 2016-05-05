@@ -1,6 +1,6 @@
 import sys
 
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 
 DEBUG_LEVELS = {'ERROR', 'WARNING', None, 'VERBOSE', 'DEBUG'}
 ERROR_LEVELS = {'ERROR', 'WARNING'}
@@ -43,6 +43,7 @@ DEFAULT_SOFT_IDR_THRESH = 0.05
 DEFAULT_IDR_THRESH = 1.00
 
 FILTER_PEAKS_BELOW_NOISE_MEAN = True
+ONLY_ALLOW_NON_NEGATIVE_VALUES = True
 
 ## optimization.py config options
 
